@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 pub const Error = error{
     NoClipboardTool,
     OscReadNotSupported,
+    ClipboardToolFailed,
 };
 
 // ── Linux / Unix ──────────────────────────────────────────────────────────────
@@ -25,16 +26,16 @@ const unix = struct {
     }
 
     fn detectTool(allocator: std.mem.Allocator) Tool {
-        // Wayland: only try when WAYLAND_DISPLAY is actually set.
-        if (std.posix.getenv("WAYLAND_DISPLAY") != null) {
+        // Wayland: only try when WAYLAND_DISPLAY is actually set (non-empty).
+        if (std.posix.getenv("WAYLAND_DISPLAY")) |wd| if (wd.len > 0) {
             if (lookPath(allocator, "wl-copy") and lookPath(allocator, "wl-paste"))
                 return .wl_clipboard;
-        }
-        // X11: only try when DISPLAY is set.
-        if (std.posix.getenv("DISPLAY") != null) {
+        };
+        // X11: only try when DISPLAY is set (non-empty).
+        if (std.posix.getenv("DISPLAY")) |d| if (d.len > 0) {
             if (lookPath(allocator, "xclip")) return .xclip;
             if (lookPath(allocator, "xsel")) return .xsel;
-        }
+        };
         // Termux (Android) — no display needed.
         if (lookPath(allocator, "termux-clipboard-get") and
             lookPath(allocator, "termux-clipboard-set")) return .termux;
@@ -106,15 +107,41 @@ const osc52 = struct {
         defer if (tty_handle.owned) tty_handle.file.close();
         const tty = tty_handle.file;
 
-        if (std.posix.getenv("TMUX") != null) {
-            // tmux DCS passthrough: each ESC inside must be doubled.
-            try tty.writeAll("\x1bPtmux;\x1b\x1b]52;c;");
-            try tty.writeAll(encoded);
-            try tty.writeAll("\x07\x1b\\");
-        } else {
-            try tty.writeAll("\x1b]52;c;");
-            try tty.writeAll(encoded);
-            try tty.writeAll("\x07");
+        // Detect the outer multiplexer so we can wrap OSC 52 in the correct
+        // DCS passthrough sequence.  Check env vars first (most reliable), then
+        // fall back to $TERM which is inherited via SSH from the outer session.
+        //   tmux:   $TMUX set, or $TERM starts with "tmux"
+        //   screen: $STY  set, or $TERM starts with "screen" (and not tmux)
+        const Mux = enum { tmux, screen, none };
+        const mux: Mux = blk: {
+            if (std.posix.getenv("TMUX")) |v| if (v.len > 0) break :blk .tmux;
+            if (std.posix.getenv("STY"))  |v| if (v.len > 0) break :blk .screen;
+            if (std.posix.getenv("TERM")) |term| {
+                if (std.mem.startsWith(u8, term, "tmux"))   break :blk .tmux;
+                if (std.mem.startsWith(u8, term, "screen")) break :blk .screen;
+            }
+            break :blk .none;
+        };
+        switch (mux) {
+            .tmux => {
+                // tmux DCS passthrough: each ESC inside must be doubled.
+                // Sequence: ESC P tmux ; ESC ESC ] 52 ; c ; <base64> BEL ESC \
+                try tty.writeAll("\x1bPtmux;\x1b\x1b]52;c;");
+                try tty.writeAll(encoded);
+                try tty.writeAll("\x07\x1b\\");
+            },
+            .screen => {
+                // GNU screen DCS passthrough: same doubling rule, no "tmux;" prefix.
+                // Sequence: ESC P ESC ESC ] 52 ; c ; <base64> BEL ESC \
+                try tty.writeAll("\x1bP\x1b\x1b]52;c;");
+                try tty.writeAll(encoded);
+                try tty.writeAll("\x07\x1b\\");
+            },
+            .none => {
+                try tty.writeAll("\x1b]52;c;");
+                try tty.writeAll(encoded);
+                try tty.writeAll("\x07");
+            },
         }
     }
 };
@@ -245,7 +272,11 @@ fn spawnAndWrite(allocator: std.mem.Allocator, argv: []const []const u8, text: [
     child.stdin.?.close();
     child.stdin = null;
 
-    _ = try child.wait();
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.ClipboardToolFailed,
+        else => return error.ClipboardToolFailed,
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
