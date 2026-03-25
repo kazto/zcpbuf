@@ -119,6 +119,88 @@ const osc52 = struct {
     }
 };
 
+// ── Windows ───────────────────────────────────────────────────────────────────
+//
+// Uses Win32 clipboard API via user32.dll and kernel32.dll.
+// Text is exchanged as null-terminated UTF-16LE (CF_UNICODETEXT).
+// Follows the same open/lock/unlock/close pattern as the Go reference impl.
+
+const winclip = struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const BOOL = std.os.windows.BOOL;
+    const UINT = std.os.windows.UINT;
+    const SIZE_T = std.os.windows.SIZE_T;
+
+    const CF_UNICODETEXT: UINT = 13;
+    const GMEM_MOVEABLE: UINT = 0x0002;
+
+    extern "user32" fn IsClipboardFormatAvailable(uFormat: UINT) callconv(.winapi) BOOL;
+    extern "user32" fn OpenClipboard(hWndNewOwner: ?*anyopaque) callconv(.winapi) BOOL;
+    extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
+    extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
+    extern "user32" fn GetClipboardData(uFormat: UINT) callconv(.winapi) ?HANDLE;
+    extern "user32" fn SetClipboardData(uFormat: UINT, hMem: HANDLE) callconv(.winapi) ?HANDLE;
+
+    extern "kernel32" fn GlobalAlloc(uFlags: UINT, dwBytes: SIZE_T) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GlobalFree(hMem: HANDLE) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GlobalLock(hMem: HANDLE) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GlobalUnlock(hMem: HANDLE) callconv(.winapi) BOOL;
+
+    /// Try to open the clipboard for up to 1 second (matches Go reference impl).
+    fn waitOpenClipboard() !void {
+        var i: u32 = 0;
+        while (i < 1000) : (i += 1) {
+            if (OpenClipboard(null) != 0) return;
+            std.Thread.sleep(std.time.ns_per_ms);
+        }
+        return error.OpenClipboardFailed;
+    }
+
+    fn readAll(allocator: std.mem.Allocator) ![]u8 {
+        if (IsClipboardFormatAvailable(CF_UNICODETEXT) == 0)
+            return error.ClipboardFormatUnavailable;
+
+        try waitOpenClipboard();
+        defer _ = CloseClipboard();
+
+        const h = GetClipboardData(CF_UNICODETEXT) orelse
+            return error.GetClipboardDataFailed;
+
+        const ptr = GlobalLock(h) orelse return error.GlobalLockFailed;
+        defer _ = GlobalUnlock(h);
+
+        const wide: [*:0]const u16 = @ptrCast(@alignCast(ptr));
+        const wide_len = std.mem.len(wide);
+        return std.unicode.utf16LeToUtf8Alloc(allocator, wide[0..wide_len]);
+    }
+
+    fn writeAll(allocator: std.mem.Allocator, text: []const u8) !void {
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(allocator, text);
+        defer allocator.free(wide);
+
+        // Allocate global memory: (len + null terminator) × 2 bytes
+        const byte_count: SIZE_T = (wide.len + 1) * @sizeOf(u16);
+
+        try waitOpenClipboard();
+        defer _ = CloseClipboard();
+
+        if (EmptyClipboard() == 0) return error.EmptyClipboardFailed;
+
+        const h = GlobalAlloc(GMEM_MOVEABLE, byte_count) orelse
+            return error.GlobalAllocFailed;
+        errdefer _ = GlobalFree(h); // freed only on error; SetClipboardData takes ownership on success
+
+        const ptr = GlobalLock(h) orelse return error.GlobalLockFailed;
+        const dst: [*]u16 = @ptrCast(@alignCast(ptr));
+        @memcpy(dst[0 .. wide.len + 1], wide.ptr[0 .. wide.len + 1]);
+        _ = GlobalUnlock(h);
+
+        if (SetClipboardData(CF_UNICODETEXT, h) == null)
+            return error.SetClipboardDataFailed;
+        // ownership transferred to the system — suppress errdefer via normal return
+    }
+};
+
 // ── macOS ─────────────────────────────────────────────────────────────────────
 
 const darwin = struct {
@@ -175,6 +257,7 @@ pub fn readAll(allocator: std.mem.Allocator) ![]u8 {
     return switch (builtin.os.tag) {
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => unix.readAll(allocator),
         .macos => darwin.readAll(allocator),
+        .windows => winclip.readAll(allocator),
         else => @compileError("unsupported platform"),
     };
 }
@@ -186,6 +269,7 @@ pub fn writeAll(allocator: std.mem.Allocator, text: []const u8) !void {
     return switch (builtin.os.tag) {
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => unix.writeAll(allocator, text),
         .macos => darwin.writeAll(allocator, text),
+        .windows => winclip.writeAll(allocator, text),
         else => @compileError("unsupported platform"),
     };
 }
